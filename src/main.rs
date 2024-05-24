@@ -1,5 +1,6 @@
 use futures::{future, sink, stream};
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::time;
 
 mod servo_cmd;
 
@@ -144,7 +145,7 @@ type CanFrameTx = sink::SinkErrInto<
     anyhow::Error,
 >;
 type CanFrameRx =
-stream::ErrInto<tokio_stream::wrappers::BroadcastStream<socketcan::CanFrame>, anyhow::Error>;
+    stream::ErrInto<tokio_stream::wrappers::BroadcastStream<socketcan::CanFrame>, anyhow::Error>;
 
 async fn par_map_canbus<A, I, Tx, Rx, F, R, RV>(
     values: I,
@@ -152,12 +153,12 @@ async fn par_map_canbus<A, I, Tx, Rx, F, R, RV>(
     mut can_rx: Rx,
     ref action: F,
 ) -> anyhow::Result<Vec<RV>>
-    where
-        I: IntoIterator<Item=A>,
-        Tx: sink::Sink<socketcan::CanFrame, Error=socketcan::Error> + Unpin,
-        Rx: stream::Stream<Item=socketcan::Result<socketcan::CanFrame>> + Unpin,
-        F: Fn(A, CanFrameTx, CanFrameRx) -> R,
-        R: future::Future<Output=anyhow::Result<RV>>,
+where
+    I: IntoIterator<Item = A>,
+    Tx: sink::Sink<socketcan::CanFrame, Error = anyhow::Error> + Unpin,
+    Rx: stream::Stream<Item = anyhow::Result<socketcan::CanFrame>> + Unpin,
+    F: Fn(A, CanFrameTx, CanFrameRx) -> R,
+    R: future::Future<Output = anyhow::Result<RV>>,
 {
     use future::FutureExt as _;
     use futures_util::stream::TryStreamExt as _;
@@ -204,154 +205,245 @@ async fn par_map_canbus<A, I, Tx, Rx, F, R, RV>(
             tokio_stream::wrappers::BroadcastStream::new(can_broadcast_tx.subscribe()).err_into();
         action(value, can_tx, can_rx)
     }))
-        .inspect(|_| done_tx_send.send(()).unwrap())
-        .inspect(|_| done_rx_send.send(()).unwrap());
+    .inspect(|_| done_tx_send.send(()).unwrap())
+    .inspect(|_| done_rx_send.send(()).unwrap());
     let (_, _, results) = future::try_join3(rx_task, tx_task, workers_task).await?;
     anyhow::Ok(results)
 }
 
+#[tracing::instrument(skip(can_tx, can_rx))]
 async fn init_axis(
     axis: Axis,
-    mut can_tx: impl sink::Sink<socketcan::CanFrame, Error=anyhow::Error> + Unpin,
-    mut can_rx: impl stream::Stream<Item=anyhow::Result<socketcan::CanFrame>> + Unpin,
+    mut can_tx: impl sink::Sink<socketcan::CanFrame, Error = anyhow::Error> + Unpin,
+    mut can_rx: impl stream::Stream<Item = anyhow::Result<socketcan::CanFrame>> + Unpin,
 ) -> anyhow::Result<()> {
     use sink::SinkExt as _;
-    use socketcan::EmbeddedFrame as _;
-    use stream::StreamExt as _;
 
-    let request = servo_cmd::ServoRequest::SetWorkMode {
-        work_mode: servo_cmd::WorkMode::SrVFoc,
-    }
-        .to_frame(axis.id())?;
-    can_tx.send(request).await?;
-    while let Some(frame) = can_rx.next().await {
-        let frame = frame?;
-        if frame.id() == axis.id() {
-            let response = servo_cmd::ServoResponse::from_frame(axis.id(), frame)?;
-            if let servo_cmd::ServoResponse::SetWorkMode { success } = response {
-                println!("{:?}={}", axis, if success { "success" } else { "fail" });
-                break;
-            }
+    let set_work_mode = can_tx.send(
+        servo_cmd::ServoRequest::SetWorkMode {
+            work_mode: servo_cmd::WorkMode::SrVFoc,
         }
-    }
-    anyhow::Ok(())
+        .to_frame(axis.id())?,
+    );
+    let await_work_mode = await_axis_response(&mut can_rx, axis, |response| async move {
+        if let servo_cmd::ServoResponse::SetWorkMode { success } = response {
+            let status = if success { "success" } else { "fail" };
+            tracing::info!("set SR_vFOC work mode: {status}");
+            if success {
+                Ok(Some(()))
+            } else {
+                anyhow::bail!("failed to set work mode for axis {axis:?}")
+            }
+        } else {
+            Ok(None)
+        }
+    });
+
+    futures::try_join!(set_work_mode, await_work_mode)?;
+
+    let set_display_off =
+        can_tx.send(servo_cmd::ServoRequest::SetAutoSSD { enable: true }.to_frame(axis.id())?);
+    let await_display_off = await_axis_response(&mut can_rx, axis, |response| async move {
+        if let servo_cmd::ServoResponse::SetAutoSSD { success } = response {
+            let status = if success { "success" } else { "fail" };
+            tracing::info!("turn off display: {status}");
+            if success {
+                Ok(Some(()))
+            } else {
+                anyhow::bail!("failed to turn off display for axis {axis:?}")
+            }
+        } else {
+            Ok(None)
+        }
+    });
+
+    futures::try_join!(set_display_off, await_display_off)?;
+
+    Ok(())
 }
 
+#[tracing::instrument(skip(can_tx, can_rx))]
 async fn enable_axis(
     axis: Axis,
-    mut can_tx: impl sink::Sink<socketcan::CanFrame, Error=anyhow::Error> + Unpin,
-    mut can_rx: impl stream::Stream<Item=anyhow::Result<socketcan::CanFrame>> + Unpin,
+    mut can_tx: impl sink::Sink<socketcan::CanFrame, Error = anyhow::Error> + Unpin,
+    can_rx: impl stream::Stream<Item = anyhow::Result<socketcan::CanFrame>> + Unpin,
 ) -> anyhow::Result<()> {
     use futures_util::SinkExt as _;
-    use socketcan::EmbeddedFrame as _;
-    use stream::StreamExt as _;
 
-    let request = servo_cmd::ServoRequest::Enable { enabled: true }.to_frame(axis.id())?;
-    can_tx.send(request).await?;
-    while let Some(frame) = can_rx.next().await {
-        let frame = frame?;
-        if frame.id() == axis.id() {
-            let response = servo_cmd::ServoResponse::from_frame(axis.id(), frame)?;
-            if let servo_cmd::ServoResponse::Enable { success } = response {
-                println!("{:?}={}", axis, if success { "success" } else { "fail" });
-                break;
+    let set_enabled =
+        can_tx.send(servo_cmd::ServoRequest::Enable { enabled: true }.to_frame(axis.id())?);
+    let await_enabled = await_axis_response(can_rx, axis, |response| async move {
+        if let servo_cmd::ServoResponse::Enable { success } = response {
+            let status = if success { "success" } else { "fail" };
+            tracing::info!("enable: {status}");
+            if success {
+                Ok(Some(()))
+            } else {
+                anyhow::bail!("failed to enable axis {axis:?}")
             }
+        } else {
+            Ok(None)
         }
-    }
-    anyhow::Ok(())
+    });
+
+    futures::try_join!(set_enabled, await_enabled)?;
+
+    Ok(())
 }
 
+#[tracing::instrument(skip(can_tx, can_rx))]
 async fn set_origin(
     axis: Axis,
-    mut can_tx: impl sink::Sink<socketcan::CanFrame, Error=anyhow::Error> + Unpin,
-    mut can_rx: impl stream::Stream<Item=anyhow::Result<socketcan::CanFrame>> + Unpin,
+    mut can_tx: impl sink::Sink<socketcan::CanFrame, Error = anyhow::Error> + Unpin,
+    can_rx: impl stream::Stream<Item = anyhow::Result<socketcan::CanFrame>> + Unpin,
 ) -> anyhow::Result<()> {
     use futures_util::SinkExt as _;
-    use socketcan::EmbeddedFrame as _;
-    use stream::StreamExt as _;
 
-    let request = servo_cmd::ServoRequest::SetAxisZero.to_frame(axis.id())?;
-    can_tx.send(request).await?;
-    while let Some(frame) = can_rx.next().await {
-        let frame = frame?;
-        if frame.id() == axis.id() {
-            let response = servo_cmd::ServoResponse::from_frame(axis.id(), frame)?;
-            if let servo_cmd::ServoResponse::SetAxisZero { success } = response {
-                println!("{:?}={}", axis, if success { "success" } else { "fail" });
-                break;
+    let set_axis_zero = can_tx.send(servo_cmd::ServoRequest::SetAxisZero.to_frame(axis.id())?);
+    let await_axis_zero = await_axis_response(can_rx, axis, |response| async move {
+        if let servo_cmd::ServoResponse::SetAxisZero { success } = response {
+            let status = if success { "success" } else { "fail" };
+            tracing::info!("set origin: {status}");
+            if success {
+                Ok(Some(()))
+            } else {
+                anyhow::bail!("failed to set origin for axis {axis:?}")
             }
+        } else {
+            Ok(None)
         }
-    }
-    anyhow::Ok(())
+    });
+
+    futures::try_join!(set_axis_zero, await_axis_zero)?;
+
+    Ok(())
 }
 
+#[tracing::instrument(skip(can_tx, can_rx))]
 async fn get_axis_pos_raw(
     axis: Axis,
-    mut can_tx: impl sink::Sink<socketcan::CanFrame, Error=anyhow::Error> + Unpin,
-    mut can_rx: impl stream::Stream<Item=anyhow::Result<socketcan::CanFrame>> + Unpin,
+    mut can_tx: impl sink::Sink<socketcan::CanFrame, Error = anyhow::Error> + Unpin,
+    can_rx: impl stream::Stream<Item = anyhow::Result<socketcan::CanFrame>> + Unpin,
 ) -> anyhow::Result<Option<i64>> {
     use futures_util::SinkExt as _;
-    use socketcan::EmbeddedFrame as _;
-    use stream::StreamExt as _;
 
-    let request = servo_cmd::ServoRequest::ReadEncoderValueAddition.to_frame(axis.id())?;
-    can_tx.send(request).await?;
-    while let Some(frame) = can_rx.next().await {
-        let frame = frame?;
-        if frame.id() == axis.id() {
-            let response = servo_cmd::ServoResponse::from_frame(axis.id(), frame)?;
-            if let servo_cmd::ServoResponse::ReadEncoderValueAddition { value } = response {
-                println!("{:?}={}", axis, value);
-                return anyhow::Ok(Some(value));
-            }
+    let read_encoder_value =
+        can_tx.send(servo_cmd::ServoRequest::ReadEncoderValueAddition.to_frame(axis.id())?);
+    let await_encoder_value = await_axis_response(can_rx, axis, |response| async move {
+        if let servo_cmd::ServoResponse::ReadEncoderValueAddition { value } = response {
+            tracing::info!("read encoder value: {value}");
+            Ok(Some(value))
+        } else {
+            Ok(None)
         }
-    }
-    anyhow::Ok(None)
+    });
+
+    let value = futures::try_join!(read_encoder_value, await_encoder_value)?.1;
+
+    Ok(value)
 }
 
+#[tracing::instrument(skip(can_tx, can_rx))]
 async fn set_axis_pos_raw(
     axis: Axis,
     position: f64,
     speed: u16,
     accel: u8,
-    mut can_tx: impl sink::Sink<socketcan::CanFrame, Error=anyhow::Error> + Unpin,
-    mut can_rx: impl stream::Stream<Item=anyhow::Result<socketcan::CanFrame>> + Unpin,
+    mut can_tx: impl sink::Sink<socketcan::CanFrame, Error = anyhow::Error> + Unpin,
+    can_rx: impl stream::Stream<Item = anyhow::Result<socketcan::CanFrame>> + Unpin,
 ) -> anyhow::Result<()> {
     use futures_util::SinkExt as _;
-    use socketcan::EmbeddedFrame as _;
-    use stream::StreamExt as _;
 
     let request = servo_cmd::ServoRequest::RunPositionAbsoluteMotionMode {
         speed,
         accel,
         abs_axis: (position * 0x4000 as f64) as i32,
     }
-        .to_frame(axis.id())?;
+    .to_frame(axis.id())?;
     can_tx.send(request).await?;
-    while let Some(frame) = can_rx.next().await {
-        let frame = frame?;
-        if frame.id() == axis.id() {
-            let response = servo_cmd::ServoResponse::from_frame(axis.id(), frame)?;
-            if let servo_cmd::ServoResponse::RunPositionAbsoluteMotionMode { status } = response {
-                println!("{:?}={:?}", axis, status);
-                if status != servo_cmd::MotionStatus::Busy {
-                    break;
+
+    await_axis_response(can_rx, axis, |response| async move {
+        if let servo_cmd::ServoResponse::RunPositionAbsoluteMotionMode { status } = response {
+            tracing::info!("set axis pos: {status:?}");
+            match status {
+                servo_cmd::MotionStatus::Fail => {
+                    anyhow::bail!("failed to set origin for axis {axis:?}")
+                }
+                servo_cmd::MotionStatus::Busy => {
+                    Ok(None)
+                }
+                servo_cmd::MotionStatus::Success => {
+                    Ok(Some(()))
+                }
+                servo_cmd::MotionStatus::LimitReached => {
+                    tracing::warn!("endstop triggered when trying to set axis position to {position} for axis {axis:?}");
+                    Ok(Some(()))
+                }
+            }
+        } else {
+            Ok(None)
+        }
+    })
+    .await?;
+
+    Ok(())
+}
+
+async fn await_axis_response<Rx, H, F, A>(
+    mut can_rx: Rx,
+    axis: Axis,
+    mut response_handler: H,
+) -> anyhow::Result<Option<A>>
+where
+    Rx: stream::Stream<Item = anyhow::Result<socketcan::CanFrame>> + Unpin,
+    H: FnMut(servo_cmd::ServoResponse) -> F,
+    F: future::Future<Output = anyhow::Result<Option<A>>>,
+{
+    use anyhow::Context as _;
+    use futures_util::StreamExt as _;
+    use socketcan::EmbeddedFrame as _;
+
+    let await_response = async {
+        while let Some(frame) = can_rx.next().await {
+            let frame = frame?;
+            if frame.id() == axis.id() {
+                let response = servo_cmd::ServoResponse::from_frame(axis.id(), frame)?;
+                if let Some(a) = response_handler(response).await? {
+                    return anyhow::Ok(Some(a));
                 }
             }
         }
-    }
-    anyhow::Ok(())
+        anyhow::Ok(None)
+    };
+    let timeout = time::timeout(time::Duration::from_millis(100), await_response);
+    timeout
+        .await
+        .unwrap_or_else(|e| Err(e.into()))
+        .context(format!("didn't get a response for axis {axis:?}"))
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
     use clap::Parser as _;
-    use clap::ValueEnum as _;
-    use futures_util::StreamExt as _;
+    tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+    if let Err(err) = run(args).await {
+        tracing::error!("{err:#}");
+        std::process::exit(1);
+    }
+}
 
-    let (can_tx, can_rx) = socketcan::tokio::CanSocket::open(&args.ifname)?.split();
+async fn run(args: Args) -> anyhow::Result<()> {
+    use clap::ValueEnum as _;
+    use futures::TryStreamExt as _;
+    use futures_util::SinkExt as _;
+    use futures_util::StreamExt as _;
+
+    let socket = socketcan::tokio::CanSocket::open(&args.ifname)?;
+    let (can_tx, can_rx) = socket.split();
+    let can_tx = can_tx.sink_err_into();
+    let can_rx = can_rx.err_into();
     match args.command {
         Command::Axes {
             all,
@@ -374,7 +466,7 @@ async fn main() -> anyhow::Result<()> {
                 AxesCommand::SetMotorPos {
                     position,
                     speed,
-                    accel, // TODO
+                    accel: _, // TODO
                     accel_raw,
                 } => {
                     par_map_canbus(axes, can_tx, can_rx, |a, t, r| {
@@ -387,7 +479,7 @@ async fn main() -> anyhow::Result<()> {
                             r,
                         )
                     })
-                        .await?;
+                    .await?;
                 }
                 AxesCommand::SetOrigin => {
                     par_map_canbus(axes, can_tx, can_rx, set_origin).await?;
